@@ -1416,6 +1416,8 @@ class ProcessRewardModelWorker(Worker):
         return DataProto.from_dict(tensors=output)
     
     def _build_inputs_for_prm(self, data):
+        from torch.nn.utils.rnn import pad_sequence
+
         # fetch var
         problem_ids = data.batch['prompts']
         attention_mask = data.batch['attention_mask']
@@ -1463,13 +1465,27 @@ class ProcessRewardModelWorker(Worker):
                 torch.tensor(num_tokens_per_step_per_data, device=device),
             )
         # gather into batch
-        input_ids = right_padding(input_ids, self.tokenizer.pad_token_id)
-        attn_mask = right_padding(attn_mask, 0)
-        num_tokens_per_step = right_padding(num_tokens_per_step, 0)
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        attn_mask = pad_sequence(attn_mask, batch_first=True, padding_value=0)
+        num_tokens_per_step = pad_sequence(num_tokens_per_step, batch_first=True, padding_value=0)
+        position_ids = compute_position_id_with_mask(attn_mask)
 
-        pred_rew_ids = (score_ids + problem_length).masked_fill(
-            ~score_mask, -1
+        # maybe not necessary due to `reward mask`
+        # pred_rew_ids = (score_ids + problem_length).masked_fill(
+        #     ~score_mask, -1
+        # )
+
+        # for forward of PRM
+        output = dict(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            position_ids=position_ids,
         )
+        # for adv baseline, rather than forward of PRM
+        num_tokens_per_step = dict(num_tokens_per_step=num_tokens_per_step)
+        output = DataProto.from_dict(tensors=output)
+        num_tokens_per_step = DataProto.from_dict(tensors=num_tokens_per_step)
+        return output, num_tokens_per_step
 
     def _forward_micro_batch(self, micro_batch):
         # process reward for every tokens
@@ -1514,12 +1530,6 @@ class ProcessRewardModelWorker(Worker):
         import itertools
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
-        data = data.to('cuda')
-        data.union(self._split_steps(data))
-
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.process_reward_module)
-        
         # data.batch.keys: 
         # 'position_ids', (B, 4096)
         # 'prompts', (B, 1024)
@@ -1529,6 +1539,16 @@ class ProcessRewardModelWorker(Worker):
         # 'old_log_probs', (B, 3072)
         # 'ref_log_prob', (B, 3072)
         # 'values', (B, 3072)
+
+        # move to gpu
+        data = data.to('cuda')
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.process_reward_module)
+
+        data.union(self._split_steps(data))
+        prm_data, num_tokens_per_step = self._build_inputs_for_prm(data)
+        data.union(num_tokens_per_step)
+        ?
         
         with self.ulysses_sharding_manager:
             batch = self.ulysses_sharding_manager.preprocess_data(
