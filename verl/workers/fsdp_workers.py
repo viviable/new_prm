@@ -1203,6 +1203,11 @@ class ProcessRewardModelWorker(Worker):
         self._is_offload_param = self.config.model.fsdp_config.param_offload
         self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
 
+        self.disable_min_form_credit_assignment = self.config.get(
+            'disable_min_form_credit_assignment', False,
+        )
+        self.temperature = self.config.get('temperature', 0.1)
+
         # TODO: online training of PRM
         assert not self.config.training, "Not support yet."
         # normalize config
@@ -1488,46 +1493,87 @@ class ProcessRewardModelWorker(Worker):
         return output, num_tokens_per_step
 
     def _forward_micro_batch(self, micro_batch):
-        # process reward for every tokens
-        # only non-zero for the step separator tokens
-        process_reward_matrix = torch.zeros_like(
-            token_log_probs, 
-            device=token_log_probs.device, 
-            dtype=token_log_probs.dtype,
+        from flash_attn.bert_padding import (
+            index_first_axis,
+            pad_input,
+            rearrange,
+            unpad_input,
         )
-        process_reward = self.reward_model(input_ids, attn_mask)
-        # step-level process reward
-        process_reward = torch.stack(
-            [process_reward[i, pred_rew_ids[i]] for i in range(bs)]
-        )
-        # weighted sum of step-level process reward (approx. min)
-        process_reward = turn_process_reward_logits_to_reward(
-            process_reward, score_mask, 
-            return_outcome_reward=False, 
-            temperature=0.1,
-            disable_weighted_reward=self.strategy.args.disable_weighted_reward,
-        )
-        process_reward_matrix[samples.reward_mask] = process_reward[
-            score_mask].to(dtype=token_log_probs.dtype)
 
-        if self.use_remove_padding:
-            raise NotImplementedError
-        else:
-            ?
-            output = self.reward_module(input_ids=input_ids,
-                                        attention_mask=attention_mask,
-                                        position_ids=position_ids)
-            rm_score = output.logits  # (batch_size, seq_len, 1)
-            rm_score = rm_score.squeeze(-1)
+        from verl.utils.ulysses import (
+            gather_outpus_and_unpad,
+            ulysses_pad_and_slice_inputs,
+        )
 
-        # extract the result of the last valid token
-        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (bsz,)
-        rm_score = rm_score[torch.arange(batch_size), eos_mask_idx]
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            input_ids = micro_batch['input_ids']
+            batch, seqlen = input_ids.shape
+            attention_mask = micro_batch['attention_mask']
+            position_ids = micro_batch['position_ids']
+            reward_mask = micro_batch['reward_mask']
+
+            if self.use_remove_padding:
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
+                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                # unpad the position_ids to align the rotary
+                position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                                                      indices).transpose(0, 1)
+
+                # pad and slice the inputs if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad,
+                        position_ids_rmpad,
+                        sp_size=self.ulysses_sequence_parallel_size,
+                    )
+
+                # only pass input_ids and position_ids to enable flash_attn_varlen
+                output = self.process_reward_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False,
+                )  # prevent model thinks we are generating
+                reward_rmpad = output.logits
+                reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
+
+                # gather output if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    reward_rmpad = gather_outpus_and_unpad(reward_rmpad,
+                                                           gather_dim=0,
+                                                           unpad_dim=0,
+                                                           padding_size=pad_size)
+
+                # pad it back
+                rm_score = pad_input(reward_rmpad, indices=indices, batch=batch, seqlen=seqlen).squeeze(-1)
+            else:
+                output = self.process_reward_module(input_ids=input_ids,
+                                            attention_mask=attention_mask,
+                                            position_ids=position_ids,
+                                            use_cache=False)  # prevent model thinks we are generating
+                rm_score = output.logits  # (batch_size, seq_len, 2)
+        
+        assert rm_score.size(1) == 3072, f"wrong rm_score shape: {rm_score.shape}"
+        rm_score = rm_score.softmax(dim=-1)
+        rm_score = (rm_score[..., 1] - rm_score[..., 0]) * reward_mask  # (batch_size, seq_len)
+
+        if not self.disable_min_form_credit_assignment:
+            weight = torch.softmax(
+                -rm_score.masked_fill(
+                    ~reward_mask, float('inf')
+                ) / self.temperature,
+                dim=-1,
+            )
+            rm_score *= weight
+        
         return rm_score
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_rm_score(self, data:DataProto):
         import itertools
+
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
         # data.batch.keys: 
@@ -1539,29 +1585,26 @@ class ProcessRewardModelWorker(Worker):
         # 'old_log_probs', (B, 3072)
         # 'ref_log_prob', (B, 3072)
         # 'values', (B, 3072)
-
         # move to gpu
         data = data.to('cuda')
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.process_reward_module)
+        
+        if torch.distributed.get_rank() == 0:
+            import ipdb; ipdb.set_trace()
+        torch.distributed.barrier()
 
         data.union(self._split_steps(data))
         prm_data, num_tokens_per_step = self._build_inputs_for_prm(data)
         data.union(num_tokens_per_step)
-        ?
+        prm_data = prm_data.to('cuda')
+        prm_data.union(data.select(batch_keys=['reward_mask']))
         
         with self.ulysses_sharding_manager:
-            batch = self.ulysses_sharding_manager.preprocess_data(
-                data=data)
+            prm_data = self.ulysses_sharding_manager.preprocess_data(data=prm_data)
 
-            # prm.compute_rm_scores
             self.process_reward_module.eval()
-            # useful keys
-            select_keys = [
-                'prompts', 'responses', 'attention_mask', 
-                'position_ids', 'score_ids', 'score_mask',
-            ]
-            batch = data.select(batch_keys=select_keys).batch
+            batch = prm_data.batch
 
             use_dynamic_bsz = self.config.use_dynamic_bsz
             if use_dynamic_bsz:
@@ -1573,9 +1616,10 @@ class ProcessRewardModelWorker(Worker):
             
             output = []
             for micro_batch in micro_batches:
-                rm_score = self._forward_micro_batch(micro_batch)
+                with torch.no_grad():
+                    rm_score = self._forward_micro_batch(micro_batch)
                 output.append(rm_score)
-            scores = torch.cat(output, dim=0)
+            token_level_scores = torch.cat(output, dim=0)
             
             if use_dynamic_bsz:
                 indices = list(itertools.chain.from_iterable(indices))
@@ -1583,7 +1627,6 @@ class ProcessRewardModelWorker(Worker):
                 revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                 scores = scores[revert_indices]
 
-            token_level_scores = self._expand_to_token_level(batch, scores)?
             output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
