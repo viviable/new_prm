@@ -1415,12 +1415,103 @@ class ProcessRewardModelWorker(Worker):
         )
         return DataProto.from_dict(tensors=output)
     
+    def _build_inputs_for_prm(self, data):
+        # fetch var
+        problem_ids = data.batch['prompts']
+        attention_mask = data.batch['attention_mask']
+        solution_tokens = data.batch['responses']
+        score_ids = data.batch['score_ids']
+        score_mask = data.batch['score_mask']
+        bs, problem_length = problem_ids.shape
+        problem_attn_mask = attention_mask[:, :problem_length]
+        solution_attn_mask = attention_mask[:, problem_length:]
+        device = problem_ids.device
+
+        # build input_ids, attn_mask, and position_ids for PRM
+        # (optional) remove '\n\n' at the end of each step, 
+        # then add '\n' for each step to predict process reward
+        input_ids = []
+        attn_mask = []
+        num_tokens_per_step = []  # for adv baseline
+        for i in range(bs):
+            input_ids_per_data = problem_ids[i]
+            attn_mask_per_data = problem_attn_mask[i]
+            num_tokens_per_step_per_data = []
+            # split tokens of each step
+            for idx, j in enumerate(score_ids[i][score_mask[i]]):
+                # j -> '\n\n'
+                if idx == 0:
+                    start_idx = 0
+                else:
+                    start_idx = score_ids[i, idx - 1] + 1
+                # slicer [..., :j] means drop the last '\n\n' of each step
+                step_tokens = solution_tokens[i, start_idx:j]
+                step_attn_mask = solution_attn_mask[i, start_idx:j]
+                num_tokens_per_step_per_data.append(j - start_idx)
+                # add '\n' after each step to predict process reward
+                input_ids_per_data = torch.cat(
+                    (input_ids_per_data, step_tokens, self.step_separator_token)
+                )
+                attn_mask_per_data = torch.cat(
+                    (attn_mask_per_data, step_attn_mask, torch.ones(
+                        1, device=device, dtype=attn_mask_per_data.dtype
+                    ))
+                )
+            input_ids.append(input_ids_per_data)
+            attn_mask.append(attn_mask_per_data)
+            num_tokens_per_step.append(
+                torch.tensor(num_tokens_per_step_per_data, device=device),
+            )
+        # gather into batch
+        input_ids = right_padding(input_ids, self.tokenizer.pad_token_id)
+        attn_mask = right_padding(attn_mask, 0)
+        num_tokens_per_step = right_padding(num_tokens_per_step, 0)
+
+        pred_rew_ids = (score_ids + problem_length).masked_fill(
+            ~score_mask, -1
+        )
+
     def _forward_micro_batch(self, micro_batch):
-        ?
-        pass
+        # process reward for every tokens
+        # only non-zero for the step separator tokens
+        process_reward_matrix = torch.zeros_like(
+            token_log_probs, 
+            device=token_log_probs.device, 
+            dtype=token_log_probs.dtype,
+        )
+        process_reward = self.reward_model(input_ids, attn_mask)
+        # step-level process reward
+        process_reward = torch.stack(
+            [process_reward[i, pred_rew_ids[i]] for i in range(bs)]
+        )
+        # weighted sum of step-level process reward (approx. min)
+        process_reward = turn_process_reward_logits_to_reward(
+            process_reward, score_mask, 
+            return_outcome_reward=False, 
+            temperature=0.1,
+            disable_weighted_reward=self.strategy.args.disable_weighted_reward,
+        )
+        process_reward_matrix[samples.reward_mask] = process_reward[
+            score_mask].to(dtype=token_log_probs.dtype)
+
+        if self.use_remove_padding:
+            raise NotImplementedError
+        else:
+            ?
+            output = self.reward_module(input_ids=input_ids,
+                                        attention_mask=attention_mask,
+                                        position_ids=position_ids)
+            rm_score = output.logits  # (batch_size, seq_len, 1)
+            rm_score = rm_score.squeeze(-1)
+
+        # extract the result of the last valid token
+        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (bsz,)
+        rm_score = rm_score[torch.arange(batch_size), eos_mask_idx]
+        return rm_score
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_rm_score(self, data:DataProto):
+        import itertools
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
         data = data.to('cuda')
@@ -1449,7 +1540,6 @@ class ProcessRewardModelWorker(Worker):
             select_keys = [
                 'prompts', 'responses', 'attention_mask', 
                 'position_ids', 'score_ids', 'score_mask',
-                'reward_mask', 'num_steps',
             ]
             batch = data.select(batch_keys=select_keys).batch
 
@@ -1463,13 +1553,11 @@ class ProcessRewardModelWorker(Worker):
             
             output = []
             for micro_batch in micro_batches:
-                with torch.no_grad():
-                    rm_score = self._forward_micro_batch(micro_batch)
+                rm_score = self._forward_micro_batch(micro_batch)
                 output.append(rm_score)
             scores = torch.cat(output, dim=0)
             
             if use_dynamic_bsz:
-                raise NotImplementedError
                 indices = list(itertools.chain.from_iterable(indices))
                 assert len(indices) == scores.size(0), f"{len(indices)} vs. {scores.size()}"
                 revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
