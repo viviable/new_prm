@@ -1328,6 +1328,26 @@ class ProcessRewardModelWorker(Worker):
             return process_reward_module, prm_optimizer, prm_lr_scheduler
         return process_reward_module
 
+    def _init_separator(self, config):
+        # split response into steps based on what character
+        split_step_char = config.get('split_step_char', '\n\n')
+        self.split_step_tokens = []
+        # all tokens which end with "\n\n"
+        for i in range(len(self.tokenizer)):
+            if self.tokenizer.decode(i).endswith(split_step_char):
+                self.split_step_tokens.append(i)
+        self.split_step_tokens = torch.LongTensor(
+            self.split_step_tokens, 
+        ).to(device=torch.cuda.current_device())
+
+        # token for reward prediction
+        step_separator = config.get('step_separator', '\n')
+        self.step_separator_token = self.tokenizer.encode(
+            step_separator, 
+            return_tensors='pt',
+            add_special_tokens=False,
+        ).squeeze(0).to(device=torch.cuda.current_device())
+    
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         import_external_libs(self.config.model.get('external_lib', None))
@@ -1337,6 +1357,8 @@ class ProcessRewardModelWorker(Worker):
             self.process_reward_module, self.prm_optimizer, self.prm_lr_scheduler = results
         else:
             self.process_reward_module = results
+        
+        self._init_separator(self.config)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.process_reward_module)
@@ -1351,8 +1373,120 @@ class ProcessRewardModelWorker(Worker):
 
         torch.cuda.empty_cache()
 
+    def _split_steps(self, data):
+        bs, problem_length = data.batch['prompts'].size()
+        action_mask = data.batch['attention_mask'][:, problem_length:]
+        num_actions = action_mask.size(1)
+        solution_tokens = data.batch['responses']
+
+        # find step separator, typically '\n\n'
+        row_ids, column_ids = torch.where(
+            torch.isin(solution_tokens, self.split_step_tokens)
+        )
+        # +1 for the last step with eos instead of step separator
+        max_num_steps = max(
+            [column_ids[row_ids==i].numel() for i in range(bs)]) + 1
+        # end index of each step, shape: (B, max_num_steps), type: long
+        score_ids = torch.full(
+            (bs, max_num_steps), -1, dtype=torch.long, 
+            device=torch.cuda.current_device(),
+        )
+        # whether end of step, shape: (B, max_response_tokens), type: bool
+        reward_mask = torch.zeros_like(solution_tokens, dtype=torch.bool)
+        eos_indices = num_actions - 1 - action_mask.long().fliplr().argmax(1)
+        for j in range(bs):
+            step_separators_per_data = column_ids[row_ids==j]
+            num_intermediate_steps = step_separators_per_data.numel()
+            # intermediate steps
+            score_ids[j, :num_intermediate_steps] = step_separators_per_data
+            reward_mask[j, step_separators_per_data] = True
+            # last step
+            score_ids[j, num_intermediate_steps] = eos_indices[j]
+            reward_mask[j, eos_indices[j]] = True
+        
+        score_mask = score_ids != -1
+        # score_ids, score_mask, reward_mask for data.batch['responses'],
+        # not for data.batch['input_ids']
+        output = dict(
+            score_ids=score_ids,
+            score_mask=score_mask,
+            reward_mask=reward_mask,
+            num_steps=score_mask.float().sum(dim=-1),
+        )
+        return DataProto.from_dict(tensors=output)
+    
+    def _forward_micro_batch(self, micro_batch):
+        ?
+        pass
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_rm_score(self, data:DataProto):
-        if torch.distributed.get_rank() == 0:
-            import ipdb; ipdb.set_trace()
-        torch.distributed.barrier()
+        from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
+
+        data = data.to('cuda')
+        data.union(self._split_steps(data))
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.process_reward_module)
+        
+        # data.batch.keys: 
+        # 'position_ids', (B, 4096)
+        # 'prompts', (B, 1024)
+        # 'responses', (B, 3072)
+        # 'attention_mask', (B, 4096)
+        # 'input_ids', (B, 4096) = torch.cat((prompts, responses), dim=-1)
+        # 'old_log_probs', (B, 3072)
+        # 'ref_log_prob', (B, 3072)
+        # 'values', (B, 3072)
+        
+        with self.ulysses_sharding_manager:
+            batch = self.ulysses_sharding_manager.preprocess_data(
+                data=data)
+
+            # prm.compute_rm_scores
+            self.process_reward_module.eval()
+            # useful keys
+            select_keys = [
+                'prompts', 'responses', 'attention_mask', 
+                'position_ids', 'score_ids', 'score_mask',
+                'reward_mask', 'num_steps',
+            ]
+            batch = data.select(batch_keys=select_keys).batch
+
+            use_dynamic_bsz = self.config.use_dynamic_bsz
+            if use_dynamic_bsz:
+                max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+            else:
+                micro_batches = batch.split(
+                    self.config.micro_batch_size_per_gpu)
+            
+            output = []
+            for micro_batch in micro_batches:
+                with torch.no_grad():
+                    rm_score = self._forward_micro_batch(micro_batch)
+                output.append(rm_score)
+            scores = torch.cat(output, dim=0)
+            
+            if use_dynamic_bsz:
+                raise NotImplementedError
+                indices = list(itertools.chain.from_iterable(indices))
+                assert len(indices) == scores.size(0), f"{len(indices)} vs. {scores.size()}"
+                revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                scores = scores[revert_indices]
+
+            token_level_scores = self._expand_to_token_level(batch, scores)?
+            output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1:
+            self.process_reward_module._handle.reshard(True)
+        
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.process_reward_module)
+
+        output = output.to('cpu')
+        torch.cuda.empty_cache()
+        return output
