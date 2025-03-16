@@ -138,7 +138,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, adv_norm=False):
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == AdvantageEstimator.GAE:
@@ -202,7 +202,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         response_mask = attention_mask[:, -response_length:]
         advantages, returns = core_algos.compute_rloo_outcome_advantage(token_level_rewards=token_level_rewards,
                                                                         eos_mask=response_mask,
-                                                                        index=index)
+                                                                        index=index,
+                                                                        adv_norm=adv_norm)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     else:
@@ -623,7 +624,9 @@ class RayPPOTrainer(object):
             test_batch = DataProto.from_single_dict(test_data)
 
             # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
+            # if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
+            #     return {}
+            if self.val_reward_fn is None:
                 return {}
 
             # Store original inputs
@@ -796,7 +799,7 @@ class RayPPOTrainer(object):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
             global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
-
+        
         # find global_step_folder
         if self.config.trainer.resume_mode == 'auto':
             if global_step_folder is None:
@@ -901,6 +904,7 @@ class RayPPOTrainer(object):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        assert self.config.reward_model.enable, "Not support remax with reward model yet."
                         with _timer('gen_max', timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info['do_sample'] = False
@@ -947,35 +951,46 @@ class RayPPOTrainer(object):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-                    import ipdb; ipdb.set_trace()
-                    with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
+                    # compute scores. Support both model and function-based.
+                    # We first compute the scores using reward model. Then, we call reward_fn to combine
+                    # the results from reward model and rule-based results.
+                    if self.use_rm:
+                        with _timer('rm', timing_raw):
                             # we first compute reward model score
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        # we combine with rule-based rm
+                    # we combine with rule-based rm
+                    with _timer('reward_fn', timing_raw):
                         reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
+
+                    with _timer('adv', timing_raw):
+                        if 'rm_scores' in batch.batch.keys():
+                            verifiable_reward_coef = self.config.reward_model.get('verifiable_reward_coef', 1.0)
+                            batch.batch['token_level_scores'] = reward_tensor * verifiable_reward_coef + batch.batch['rm_scores']
+                        else:
+                            batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
+                            batch, kl_metrics = apply_kl_penalty(
+                                batch,
+                                kl_ctrl=self.kl_ctrl,
+                                kl_penalty=self.config.algorithm.kl_penalty,
+                            )
                             metrics.update(kl_metrics)
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            adv_norm=self.config.algorithm.adv_norm,
+                        )
 
                     # update critic
                     if self.use_critic:

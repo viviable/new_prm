@@ -254,7 +254,7 @@ class ActorRolloutRefWorker(Worker):
             # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
             auto_wrap_policy = None
 
-        print(f'wrap_policy: {auto_wrap_policy}')
+        # print(f'wrap_policy: {auto_wrap_policy}')
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
@@ -1217,20 +1217,16 @@ class ProcessRewardModelWorker(Worker):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+        from torch.distributed.fsdp import ShardingStrategy
         from transformers import AutoConfig, AutoModelForTokenClassification
 
         from verl.utils.model import print_model_size
-        from verl.utils.torch_dtypes import PrecisionType
 
         trust_remote_code = config.model.get('trust_remote_code', False)
-
         local_path = copy_to_local(config.model.path)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
 
-        torch_dtype = self.config.model.fsdp_config.get('model_dtype', 'fp32')
-        torch_dtype = PrecisionType.to_dtype(torch_dtype)
-
+        torch_dtype = torch.bfloat16
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         model_config.num_labels = 2
 
@@ -1247,8 +1243,7 @@ class ProcessRewardModelWorker(Worker):
         
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # setattr(model_config, 'classifier_dropout', 0.)
-            # setattr(model_config, 'hidden_dropout', '0')
+            setattr(model_config, 'classifier_dropout', 0.)
             process_reward_module = AutoModelForTokenClassification.from_pretrained(
                 pretrained_model_name_or_path=local_path,
                 torch_dtype=torch_dtype,
@@ -1260,39 +1255,19 @@ class ProcessRewardModelWorker(Worker):
             # some parameters may not in torch_dtype
             process_reward_module.to(torch_dtype)
 
-            if config.model.get('enable_gradient_checkpointing', False):
-                process_reward_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+            # if config.model.get('enable_gradient_checkpointing', False):
+            #     process_reward_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+        
         if self.rank == 0:
             print_model_size(process_reward_module)
 
-        self.prm_config = model_config
-
         fsdp_config = self.config.model.fsdp_config
-        mixed_precision_config = fsdp_config.get('mixed_precision', None)
-        if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get('param_dtype', 'bf16'))
-            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
-            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
-        else:
-            param_dtype = torch.bfloat16
-            reduce_dtype = torch.float32
-            buffer_dtype = torch.float32
-
-        mixed_precision = MixedPrecision(
-            param_dtype=param_dtype, 
-            reduce_dtype=reduce_dtype, 
-            buffer_dtype=buffer_dtype,
-        )
-
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=process_reward_module, 
             config=fsdp_config.get('wrap_policy', None),
         )
 
-        log_gpu_memory_usage('Before PRM FSDP', logger=None)
-
-        fsdp_mesh = self.device_mesh
-        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        sharding_strategy = get_sharding_strategy(self.device_mesh)
 
         process_reward_module = FSDP(
             process_reward_module,
@@ -1301,7 +1276,6 @@ class ProcessRewardModelWorker(Worker):
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy,
-            mixed_precision=mixed_precision,
             sync_module_states=True,
             forward_prefetch=False,
             device_mesh=self.device_mesh,
@@ -1422,6 +1396,7 @@ class ProcessRewardModelWorker(Worker):
     
     def _build_inputs_for_prm(self, data):
         from torch.nn.utils.rnn import pad_sequence
+        from torch.nn import functional as F
 
         # fetch var
         problem_ids = data.batch['prompts']
@@ -1430,6 +1405,7 @@ class ProcessRewardModelWorker(Worker):
         score_ids = data.batch['score_ids']
         score_mask = data.batch['score_mask']
         bs, problem_length = problem_ids.shape
+        total_length = data.batch['input_ids'].size(-1)
         problem_attn_mask = attention_mask[:, :problem_length]
         solution_attn_mask = attention_mask[:, problem_length:]
         device = problem_ids.device
@@ -1439,11 +1415,9 @@ class ProcessRewardModelWorker(Worker):
         # then add '\n' for each step to predict process reward
         input_ids = []
         attn_mask = []
-        num_tokens_per_step = []  # for adv baseline
         for i in range(bs):
             input_ids_per_data = problem_ids[i]
             attn_mask_per_data = problem_attn_mask[i]
-            num_tokens_per_step_per_data = []
             # split tokens of each step
             for idx, j in enumerate(score_ids[i][score_mask[i]]):
                 # j -> '\n\n'
@@ -1454,7 +1428,6 @@ class ProcessRewardModelWorker(Worker):
                 # slicer [..., :j] means drop the last '\n\n' of each step
                 step_tokens = solution_tokens[i, start_idx:j]
                 step_attn_mask = solution_attn_mask[i, start_idx:j]
-                num_tokens_per_step_per_data.append(j - start_idx)
                 # add '\n' after each step to predict process reward
                 input_ids_per_data = torch.cat(
                     (input_ids_per_data, step_tokens, self.step_separator_token)
@@ -1466,19 +1439,13 @@ class ProcessRewardModelWorker(Worker):
                 )
             input_ids.append(input_ids_per_data)
             attn_mask.append(attn_mask_per_data)
-            num_tokens_per_step.append(
-                torch.tensor(num_tokens_per_step_per_data, device=device),
-            )
         # gather into batch
         input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         attn_mask = pad_sequence(attn_mask, batch_first=True, padding_value=0)
-        num_tokens_per_step = pad_sequence(num_tokens_per_step, batch_first=True, padding_value=0)
+        # pad to total_length at dim=1
+        input_ids = F.pad(input_ids, (0, total_length - input_ids.size(-1)), value=self.tokenizer.pad_token_id)
+        attn_mask = F.pad(attn_mask, (0, total_length - attn_mask.size(-1)), value=0)
         position_ids = compute_position_id_with_mask(attn_mask)
-
-        # maybe not necessary due to `reward mask`
-        # pred_rew_ids = (score_ids + problem_length).masked_fill(
-        #     ~score_mask, -1
-        # )
 
         # for forward of PRM
         output = dict(
@@ -1487,10 +1454,8 @@ class ProcessRewardModelWorker(Worker):
             position_ids=position_ids,
         )
         # for adv baseline, rather than forward of PRM
-        num_tokens_per_step = dict(num_tokens_per_step=num_tokens_per_step)
         output = DataProto.from_dict(tensors=output)
-        num_tokens_per_step = DataProto.from_dict(tensors=num_tokens_per_step)
-        return output, num_tokens_per_step
+        return output
 
     def _forward_micro_batch(self, micro_batch):
         from flash_attn.bert_padding import (
@@ -1504,8 +1469,10 @@ class ProcessRewardModelWorker(Worker):
             gather_outpus_and_unpad,
             ulysses_pad_and_slice_inputs,
         )
+        
+        response_length = micro_batch['responses'].size(-1)
 
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
             batch, seqlen = input_ids.shape
             attention_mask = micro_batch['attention_mask']
@@ -1550,15 +1517,14 @@ class ProcessRewardModelWorker(Worker):
                 rm_score = pad_input(reward_rmpad, indices=indices, batch=batch, seqlen=seqlen).squeeze(-1)
             else:
                 output = self.process_reward_module(input_ids=input_ids,
-                                            attention_mask=attention_mask,
-                                            position_ids=position_ids,
-                                            use_cache=False)  # prevent model thinks we are generating
+                                                    attention_mask=attention_mask,
+                                                    position_ids=position_ids)
                 rm_score = output.logits  # (batch_size, seq_len, 2)
         
-        assert rm_score.size(1) == 3072, f"wrong rm_score shape: {rm_score.shape}"
+        rm_score = rm_score[:, -response_length:]
         rm_score = rm_score.softmax(dim=-1)
         rm_score = (rm_score[..., 1] - rm_score[..., 0]) * reward_mask  # (batch_size, seq_len)
-
+        
         if not self.disable_min_form_credit_assignment:
             weight = torch.softmax(
                 -rm_score.masked_fill(
@@ -1576,29 +1542,14 @@ class ProcessRewardModelWorker(Worker):
 
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
-        # data.batch.keys: 
-        # 'position_ids', (B, 4096)
-        # 'prompts', (B, 1024)
-        # 'responses', (B, 3072)
-        # 'attention_mask', (B, 4096)
-        # 'input_ids', (B, 4096) = torch.cat((prompts, responses), dim=-1)
-        # 'old_log_probs', (B, 3072)
-        # 'ref_log_prob', (B, 3072)
-        # 'values', (B, 3072)
-        # move to gpu
         data = data.to('cuda')
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.process_reward_module)
-        
-        if torch.distributed.get_rank() == 0:
-            import ipdb; ipdb.set_trace()
-        torch.distributed.barrier()
 
         data.union(self._split_steps(data))
-        prm_data, num_tokens_per_step = self._build_inputs_for_prm(data)
-        data.union(num_tokens_per_step)
+        prm_data = self._build_inputs_for_prm(data)
         prm_data = prm_data.to('cuda')
-        prm_data.union(data.select(batch_keys=['reward_mask']))
+        prm_data.union(data.select(batch_keys=['reward_mask', 'responses']))
         
         with self.ulysses_sharding_manager:
             prm_data = self.ulysses_sharding_manager.preprocess_data(data=prm_data)
@@ -1611,21 +1562,19 @@ class ProcessRewardModelWorker(Worker):
                 max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                 micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
             else:
-                micro_batches = batch.split(
-                    self.config.micro_batch_size_per_gpu)
+                micro_batches = batch.split(self.config.micro_batch_size_per_gpu)
             
             output = []
             for micro_batch in micro_batches:
-                with torch.no_grad():
-                    rm_score = self._forward_micro_batch(micro_batch)
+                rm_score = self._forward_micro_batch(micro_batch)
                 output.append(rm_score)
             token_level_scores = torch.cat(output, dim=0)
             
             if use_dynamic_bsz:
                 indices = list(itertools.chain.from_iterable(indices))
-                assert len(indices) == scores.size(0), f"{len(indices)} vs. {scores.size()}"
+                assert len(indices) == token_level_scores.size(0), f"{len(indices)} vs. {token_level_scores.size()}"
                 revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-                scores = scores[revert_indices]
+                token_level_scores = token_level_scores[revert_indices]
 
             output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)

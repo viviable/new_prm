@@ -88,8 +88,8 @@ class PrimeRewardManager:
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if 'rm_scores' in data.batch.keys():
-            return data.batch['rm_scores']
+        # if 'rm_scores' in data.batch.keys():
+        #     return data.batch['rm_scores']
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
@@ -102,8 +102,10 @@ class PrimeRewardManager:
         response_ids = data.batch['responses']
         valid_response_length = data.batch['attention_mask'][:, prompt_length:].sum(dim=-1)
         sequences_str = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
-        ground_truth = [data_item.non_tensor_batch['reward_model']['ground_truth'] for data_item in data]
-        data_sources = data.non_tensor_batch['data_source']
+        # ground_truth = [data_item.non_tensor_batch['reward_model']['ground_truth'] for data_item in data]
+        # data_sources = data.non_tensor_batch['data_source']
+        ground_truth = [data_item.non_tensor_batch['answer'] for data_item in data]
+        data_sources = ['numina_aops_forum'] * len(sequences_str)  # tricky: force to use prime_math.compute_score
 
         assert len(sequences_str) == len(ground_truth) == len(data_sources)
         try:

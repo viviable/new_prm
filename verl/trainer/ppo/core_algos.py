@@ -154,10 +154,10 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
     return scores, scores
 
 
-def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
-                                   eos_mask: torch.Tensor,
-                                   index: torch.Tensor,
-                                   epsilon: float = 1e-6):
+def compute_rloo_outcome_advantage_backup(token_level_rewards: torch.Tensor,
+                                          eos_mask: torch.Tensor,
+                                          index: torch.Tensor,
+                                          epsilon: float = 1e-6):
     """
     Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
     Args:
@@ -192,11 +192,58 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
         for i in range(bsz):
             response_num = len(id2score[index[i]])
             if response_num > 1:
-                scores[i] = scores[i] * response_num / (response_num -
-                                                        1) - id2mean[index[i]] * response_num / (response_num - 1)
+                scores[i] = scores[i] * response_num / (response_num - 1) - id2mean[index[i]] * response_num / (response_num - 1)
         scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
 
     return scores, scores
+
+
+def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
+                                   eos_mask: torch.Tensor,
+                                   index: torch.Tensor,
+                                   epsilon: float = 1e-6,
+                                   adv_norm: bool = False):
+    """
+    Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    response_length = token_level_rewards.shape[-1]
+    returns = (token_level_rewards * eos_mask).fliplr().cumsum(dim=-1).fliplr() * eos_mask
+
+    id2return = defaultdict(list)
+    id2sum = {}
+
+    with torch.no_grad():
+        bsz = returns.shape[0]
+        for i in range(bsz):
+            id2return[index[i]].append(returns[i].sum())
+        for idx in id2return:
+            if len(id2return[idx]) > 0:
+                id2sum[idx] = torch.sum(torch.tensor(id2return[idx]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            response_num = len(id2return[index[i]])
+            token_level_baseline = (id2sum[index[i]] - returns[i].sum()) / ((response_num - 1) * response_length)
+            returns[i] -= token_level_baseline
+        
+        returns *= eos_mask
+        advantages = returns.clone()
+        if adv_norm:
+            advantages = verl_F.masked_whiten(advantages, eos_mask)
+            advantages *= eos_mask
+
+    return advantages, returns
 
 
 def compute_reinforce_plus_plus_outcome_advantage(token_level_rewards: torch.Tensor, eos_mask: torch.Tensor,
