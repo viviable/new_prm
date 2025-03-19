@@ -145,7 +145,7 @@ reward_model:
   use_dynamic_bsz: True
   forward_max_token_len_per_gpu: 24000
   reward_manager: prime
-  verifiable_reward_coef: 1.0
+  verifiable_reward_coef: 10.0
 
 algorithm:
   gamma: 1.0
