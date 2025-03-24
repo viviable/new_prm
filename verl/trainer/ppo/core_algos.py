@@ -202,7 +202,8 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    eos_mask: torch.Tensor,
                                    index: torch.Tensor,
                                    epsilon: float = 1e-6,
-                                   adv_norm: bool = False):
+                                   adv_norm: bool = False,
+                                   return_aggregate_method: str = 'sum'):
     """
     Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
     Args:
@@ -217,8 +218,16 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
         Returns: `(torch.Tensor)`
             shape: (bs, response_length)
     """
+    assert return_aggregate_method in ['sum', 'min']
     response_length = token_level_rewards.shape[-1]
-    returns = (token_level_rewards * eos_mask).fliplr().cumsum(dim=-1).fliplr() * eos_mask
+
+    if return_aggregate_method == 'sum':
+        # gamma = 1.0
+        returns = (token_level_rewards * eos_mask).fliplr().cumsum(dim=-1).fliplr() * eos_mask
+    else:
+        returns = token_level_rewards * eos_mask
+        for col in range(response_length-2, -1, -1):
+            returns[:, col] = torch.min(returns[:, col], returns[:, col+1])
 
     id2return = defaultdict(list)
     id2sum = {}

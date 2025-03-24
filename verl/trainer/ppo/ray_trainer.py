@@ -138,7 +138,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, adv_norm=False):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, adv_norm=False, return_aggregate_method='sum'):
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == AdvantageEstimator.GAE:
@@ -203,7 +203,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         advantages, returns = core_algos.compute_rloo_outcome_advantage(token_level_rewards=token_level_rewards,
                                                                         eos_mask=response_mask,
                                                                         index=index,
-                                                                        adv_norm=adv_norm)
+                                                                        adv_norm=adv_norm,
+                                                                        return_aggregate_method=return_aggregate_method)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     else:
@@ -410,6 +411,17 @@ class RayPPOTrainer(object):
             self.use_critic = False
         else:
             raise NotImplementedError
+        
+        credit_assignment = self.config.reward_model.credit_assignment
+        assert isinstance(credit_assignment, float) or \
+            credit_assignment in ['gamma-decay', 'strict min-form']
+        if credit_assignment == 'strict min-form':
+            self.return_aggregate_method = 'min'
+        else:
+            self.return_aggregate_method = 'sum'
+        assert self.config.algorithm.adv_estimator in [
+            AdvantageEstimator.RLOO, AdvantageEstimator.GAE
+        ], "Not supported yet"
 
         self._validate_config()
         self._create_dataloader()
@@ -990,6 +1002,7 @@ class RayPPOTrainer(object):
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             adv_norm=self.config.algorithm.adv_norm,
+                            return_aggregate_method=self.return_aggregate_method,
                         )
 
                     # update critic

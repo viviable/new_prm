@@ -1,146 +1,131 @@
-<h1 style="text-align: center;">verl: Volcano Engine Reinforcement Learning for LLM</h1>
+<div align="center">
 
-verl is a flexible, efficient and production-ready RL training library for large language models (LLMs).
+# Stop Gamma Decay: Min-Form Credit Assignment Is All Process Reward Model Needs for Reasoning
 
-verl is the open-source version of **[HybridFlow: A Flexible and Efficient RLHF Framework](https://arxiv.org/abs/2409.19256v2)** paper.
+[![Notion](https://img.shields.io/badge/Notion-%23000000.svg?style=for-the-badge&logo=notion&logoColor=white)](https://tungsten-ink-510.notion.site/Stop-Gamma-Decay-Min-Form-Credit-Assignment-Is-All-Process-Reward-Model-Needs-for-Reasoning-19fcb6ed0184804eb07fd310b38af155?pvs=4)  [![Github](https://img.shields.io/badge/PURE-000000?style=for-the-badge&logo=github&logoColor=000&logoColor=white)](https://github.com/CJReinforce/PURE)  [![Wandb](https://img.shields.io/badge/Wandb_Report-fcd022?style=for-the-badge&logo=weightsandbiases&logoColor=000)](https://api.wandb.ai/links/cjreinforce/xvwk7pe9)  [![Wandb](https://img.shields.io/badge/Wandb_Log-fcd022?style=for-the-badge&logo=weightsandbiases&logoColor=000)](https://wandb.ai/cjreinforce/openrlhf_train_ppo/workspace?nw=nwuserchrisjina)  [![Hugging Face Collection](https://img.shields.io/badge/PURE_Collection-fcd022?style=for-the-badge&logo=huggingface&logoColor=000)](https://huggingface.co/collections/jinachris/pure-67a85510dc24acd26bb8109f)
 
-verl is flexible and easy to use with:
+</div>
 
-- **Easy extension of diverse RL algorithms**: The Hybrid programming model combines the strengths of single-controller and multi-controller paradigms to enable flexible representation and efficient execution of complex Post-Training dataflows. Allowing users to build RL dataflows in a few lines of code.
+**TL;DR:** Process Reward Model (PRM) trained on PRM800K dataset can fine-tune LLM to achieve SOTA-level mathematical reasoning capabilities for **< $150 (8 A100 GPUs * 16 hours)**.
 
-- **Seamless integration of existing LLM infra with modular APIs**: Decouples computation and data dependencies, enabling seamless integration with existing LLM frameworks, such as PyTorch FSDP, Megatron-LM and vLLM. Moreover, users can easily extend to other LLM training and inference frameworks.
+## 🎉 News:
 
-- **Flexible device mapping**: Supports various placement of models onto different sets of GPUs for efficient resource utilization and scalability across different cluster sizes.
+- [2025/03/24] We re-implement our algorithm based on verl. See [verl branch](https://github.com/volcengine/verl). 
+- [2025/02/22] 🔥🔥We release the [notion blog](https://tungsten-ink-510.notion.site/Stop-Gamma-Decay-Min-Form-Credit-Assignment-Is-All-Process-Reward-Model-Needs-for-Reasoning-19fcb6ed0184804eb07fd310b38af155?pvs=4), which details our algorithm, the difference between gamma-decay and min-form credit assignment, examples of reward hacking, and so on🔥🔥
+- [2025/02/09] We release the training, evaluation code, [wandb logs](https://wandb.ai/cjreinforce/openrlhf_train_ppo/workspace?nw=nwuserchrisjina), and [checkpoints](https://huggingface.co/collections/jinachris/pure-67a85510dc24acd26bb8109f). Paper's on it's way!
 
-- Readily integration with popular HuggingFace models
+## 📖 Introduction
 
+This month, we saw a huge boost in LLM reasoning power from the verifiable reward (VR)-based Reinforcement learning fine-tuning (ReFT), like [DeepSeek R1](https://github.com/deepseek-ai/DeepSeek-R1), [SimpleRL-Zero](https://github.com/hkust-nlp/simpleRL-reason), and [TinyZero](https://github.com/Jiayi-Pan/TinyZero). Previous work has encountered challenges and made unsuccessful attempts in exploring PRM, so we wonder: How far can PRM actually take us? How does it stack up against VR-based methods in reasoning performance, training costs?
 
-verl is fast with:
+To answer these questions, we present **PURE** (**P**rocess-s**U**pervised **R**einforcement l**E**arning). Using Qwen2.5-Math-7B as the base model, we train a PRM on 369k data from the PRM800K dataset, and then fine-tune another Qwen2.5-Math-7B model using only 8K MATH prompts, process rewards from the PRM, and optional verifiable rewards. For the RL algorithm, we use the PPO loss with an RLOO advantage estimator. We improve credit assignment by using a weighted sum of the process rewards, $\sum_t \text{softmax}(-\text{PR}_t/T)\cdot\text{PR}_t$ which approximates ${\min}_t \text{PR}_t$ when $T\rightarrow 0$, instead of the usual gamma decay sum $\sum_t \gamma^t \cdot \text{PR}_t$ to calculate return. **Our framework supports multiple reward types: only process reward (PURE-PRM), only verifiable reward (PURE-VR) which is the Deepseek-R1-zero's setting, or a mix of both (PURE-PRM+VR)**, as shown in the following table.
 
-- **State-of-the-art throughput**: By seamlessly integrating existing SOTA LLM training and inference frameworks, verl achieves high generation and training throughput.
+📊 The final model achieves pass@1 accuracy of 82.6% on MATH500, 82.5% on AMC, and 53.3% on average across 5 benchmarks, beating Qwen2.5-math-7B-instruct, PRIME, and SimpleRL with just either <1/50th RL data or 1/5th of the compute resources. 
 
-- **Efficient actor model resharding with 3D-HybridEngine**: Eliminates memory redundancy and significantly reduces communication overhead during transitions between training and generation phases.
+***All results are in pass@1 accuracy***
 
-<p align="center">
-| <a href="https://verl.readthedocs.io/en/latest/index.html"><b>Documentation</b></a> | <a href="https://arxiv.org/abs/2409.19256v2"><b>Paper</b></a> | <a href="https://join.slack.com/t/verlgroup/shared_invite/zt-2w5p9o4c3-yy0x2Q56s_VlGLsJ93A6vA"><b>Slack</b></a> | <a href="https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/WeChat.JPG"><b>Wechat</b></a> | <a href="https://x.com/verl_project"><b>Twitter</b></a>
+|                            | AIME 2024 | MATH 500 | AMC      | Minerva Math | OlympiadBench | Avg.     |
+| -------------------------- | --------- | -------- | -------- | ------------ | ------------- | -------- |
+| Qwen2.5-Math-7B-Base       | 13.3      | 71.8     | 47.5     | 29.8         | 35.1          | 39.5     |
+| Qwen-2.5-Math-7B-Instruct  | 16.7      | 83.2     | 52.5     | 37.5         | 41.3          | 46.2     |
+| Eurus-2-7B-PRIME           | 26.7      | 79.2     | 57.8     | **38.6**     | 42.1          | 48.9     |
+| Qwen2.5-7B-SimpleRL-Zero   | **33.3**  | 77.2     | 62.5     | 33.5         | 37.6          | 48.8     |
+| **Qwen2.5-7B-PURE-PRM+VR***    | 20.0      | **82.6** | **82.5** | 37.1         | 44.1          | **53.3** |
+| **Qwen2.5-7B-PURE-PRM**        | 16.7      | 81.8     | 60.0     | 38.2         | 44.7          | 49.3     |
+| **Qwen2.5-7B-PURE-VR**         | 23.3      | 79.4     | 60.0     | 36.8         | 41.8          | 48.3     |
 
-<!-- <a href=""><b>Slides</b></a> | -->
-</p>
+*The SOTA model was trained using 8K MATH problems, of which only ~800 gave ground-truth final answers that could be used to calculate VRs.
 
-## News
-- [2025/3] We will present verl(HybridFlow) at [EuroSys 2025](https://2025.eurosys.org/). See you in in Rotterdam!
-- [2025/2] verl v0.2.0.post1 is released! See [release note](https://github.com/volcengine/verl/releases/) for details.
-- [2025/2] We presented verl in the [Bytedance/NVIDIA/Anyscale Ray Meetup](https://lu.ma/ji7atxux). See you in San Jose!
-- [2025/1] [Doubao-1.5-pro](https://team.doubao.com/zh/special/doubao_1_5_pro) is released with SOTA-level performance on LLM & VLM. The RL scaling preview model is trained using verl, reaching OpenAI O1-level performance on math benchmarks (70.0 pass@1 on AIME).
-- [2024/12] The team presented <a href="https://neurips.cc/Expo/Conferences/2024/workshop/100677">Post-training LLMs: From Algorithms to Infrastructure</a> at NeurIPS 2024. [Slides](https://github.com/eric-haibin-lin/verl-data/tree/neurips) and [video](https://neurips.cc/Expo/Conferences/2024/workshop/100677) available.
-- [2024/12] verl is presented at Ray Forward 2024. Slides available [here](https://github.com/eric-haibin-lin/verl-community/blob/main/slides/Ray_Forward_2024_%E5%B7%AB%E9%94%A1%E6%96%8C.pdf).
-- [2024/10] verl is presented at Ray Summit. [Youtube video](https://www.youtube.com/watch?v=MrhMcXkXvJU&list=PLzTswPQNepXntmT8jr9WaNfqQ60QwW7-U&index=37) available.
-- [2024/08] HybridFlow (verl) is accepted to EuroSys 2025.
+> Note: [Eurus-2-7B-PRIME](https://github.com/PRIME-RL/PRIME), and [SimpleRL-Zero](https://github.com/hkust-nlp/simpleRL-reason) are also based on Qwen-2.5-Math-7B.
 
-## Key Features
+## 🔧 Quick Start
 
-- **FSDP** and **Megatron-LM** for training.
-- **vLLM** and **TGI** for rollout generation, **SGLang** support coming soon.
-- huggingface models support
-- Supervised fine-tuning
-- Reinforcement learning from human feedback with [PPO](https://github.com/volcengine/verl/tree/main/examples/ppo_trainer), [GRPO](https://github.com/volcengine/verl/tree/main/examples/grpo_trainer), [ReMax](https://github.com/volcengine/verl/tree/main/examples/remax_trainer), [Reinforce++](https://verl.readthedocs.io/en/latest/examples/config.html#algorithm), [RLOO](https://github.com/volcengine/verl/tree/main/examples/rloo_trainer/run_qwen2-7b.sh), etc
-  - Support model-based reward and function-based reward (verifiable reward)
-- flash-attention, [sequence packing](examples/ppo_trainer/run_qwen2-7b_seq_balance.sh), [long context](examples/ppo_trainer/run_deepseek7b_llm_sp2.sh) support via DeepSpeed Ulysses, [LoRA](examples/sft/gsm8k/run_qwen_05_peft.sh), [Liger-kernel](examples/sft/gsm8k/run_qwen_05_sp2_liger.sh)
-- scales up to 70B models and hundreds of GPUs
-- experiment tracking with wandb, swanlab and mlflow
+We implement our algorithm on two frameworks, OpenRLHF and verl, respectively. The `main` branch is based on openrlhf and the `verl` branch is based on verl.
 
-## Upcoming Features
-- Reward model training
-- DPO training
-- DeepSeek integration with Megatron v0.11
-- SGLang integration
-- vision language model RL
+### Installation
 
-## Getting Started
+#### OpenRLHF version
 
-**Quickstart:**
-- [Installation](https://verl.readthedocs.io/en/latest/start/install.html)
-- [Quickstart](https://verl.readthedocs.io/en/latest/start/quickstart.html)
-- [Programming Guide](https://verl.readthedocs.io/en/latest/hybrid_flow.html)
+Please follow [OpenRLHF's guidance](https://github.com/OpenRLHF/OpenRLHF/tree/main?tab=readme-ov-file#installation) to configure required environments. Then run `pip install -r requirements.txt`.
 
-**Running a PPO example step-by-step:**
-- Data and Reward Preparation
-  - [Prepare Data for Post-Training](https://verl.readthedocs.io/en/latest/preparation/prepare_data.html)
-  - [Implement Reward Function for Dataset](https://verl.readthedocs.io/en/latest/preparation/reward_function.html)
-- Understanding the PPO Example
-  - [PPO Example Architecture](https://verl.readthedocs.io/en/latest/examples/ppo_code_architecture.html)
-  - [Config Explanation](https://verl.readthedocs.io/en/latest/examples/config.html)
-  - [Run GSM8K Example](https://verl.readthedocs.io/en/latest/examples/gsm8k_example.html)
+#### verl version
 
-**Reproducible algorithm baselines:**
-- [PPO, GRPO, ReMax](https://verl.readthedocs.io/en/latest/experiment/ppo.html)
+Please refer to the [official installation guidance](https://verl.readthedocs.io/en/latest/start/install.html#install-from-custom-environment) of verl.
 
-**For code explanation and advance usage (extension):**
-- PPO Trainer and Workers
-  - [PPO Ray Trainer](https://verl.readthedocs.io/en/latest/workers/ray_trainer.html)
-  - [PyTorch FSDP Backend](https://verl.readthedocs.io/en/latest/workers/fsdp_workers.html)
-  - [Megatron-LM Backend](https://verl.readthedocs.io/en/latest/index.html)
-- Advance Usage and Extension
-  - [Ray API design tutorial](https://verl.readthedocs.io/en/latest/advance/placement.html)
-  - [Extend to Other RL(HF) algorithms](https://verl.readthedocs.io/en/latest/advance/dpo_extension.html)
-  - [Add Models with the FSDP Backend](https://verl.readthedocs.io/en/latest/advance/fsdp_extension.html)
-  - [Add Models with the Megatron-LM Backend](https://verl.readthedocs.io/en/latest/advance/megatron_extension.html)
-  - [Deployment using Separate GPU Resources](https://github.com/volcengine/verl/tree/main/examples/split_placement)
+### Training of PRM
 
-**Blogs from the community**
-- [使用verl进行GRPO分布式强化学习训练最佳实践](https://www.volcengine.com/docs/6459/1463942)
-- [HybridFlow veRL 原文浅析](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/readme.md)
-- [最高提升20倍吞吐量！豆包大模型团队发布全新 RLHF 框架，现已开源！](https://team.doubao.com/en/blog/%E6%9C%80%E9%AB%98%E6%8F%90%E5%8D%8720%E5%80%8D%E5%90%9E%E5%90%90%E9%87%8F-%E8%B1%86%E5%8C%85%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%9B%A2%E9%98%9F%E5%8F%91%E5%B8%83%E5%85%A8%E6%96%B0-rlhf-%E6%A1%86%E6%9E%B6-%E7%8E%B0%E5%B7%B2%E5%BC%80%E6%BA%90)
+We train the PRM in 2 stages using [TRL](https://github.com/huggingface/trl) and a [preprocessed PRM800K dataset](https://huggingface.co/datasets/HuggingFaceH4/prm800k-trl-dedup). In the first stage, we freeze the LLM and only train the last score layer (MLP) with 1e-4 learning rate rate for 3 epochs. In the second stage, we unfreeze the LLM and fine-tune all parameters with 1e-6 learning rate for 1 epoch. The resultant PRM is released through [HuggingFace](https://huggingface.co/jinachris/Qwen2.5-Math-7B-PRM800K).
 
-Checkout this [Jupyter Notebook](https://github.com/volcengine/verl/tree/main/examples/ppo_trainer/verl_getting_started.ipynb) to get started with PPO training with a single 24GB L4 GPU (**FREE** GPU quota provided by [Lighting Studio](https://lightning.ai/hlin-verl/studios/verl-getting-started))!
+```bash
+# on main branch
+cd PRM
+# stage 1
+bash train_stage_1.sh
+# stage 2
+bash train_stage_2.sh
+```
 
-## Performance Tuning Guide
-The performance is essential for on-policy RL algorithm. We write a detailed performance tuning guide to allow people tune the performance. See [here](https://verl.readthedocs.io/en/latest/perf/perf_tuning.html) for more details.
+### Training of LLM
 
-## vLLM v0.7 integration preview
-We have released a testing version of veRL that supports vLLM>=0.7.0. Please refer to [this document](https://github.com/volcengine/verl/blob/main/docs/README_vllm0.7.md) for installation guide and more information.
+#### OpenRLHF version
 
-## Citation and acknowledgement
+To start training, run the following command. It uses Ray+vLLM for rollout acceleration, with the first 4 GPUs allocated for the actor, initial actor (reference model), and PRM. The remaining GPUs are used for the vLLM engines. This setup works with 5 to 8 GPUs—just adjust the number of vLLM engines in the script accordingly.
 
-If you find the project helpful, please cite:
-- [HybridFlow: A Flexible and Efficient RLHF Framework](https://arxiv.org/abs/2409.19256v2)
-- [A Framework for Training Large Language Models for Code Generation via Proximal Policy Optimization](https://i.cs.hku.hk/~cwu/papers/gmsheng-NL2Code24.pdf)
+```bash
+bash examples/scripts/train_pure.sh
+```
 
-```tex
-@article{sheng2024hybridflow,
-  title   = {HybridFlow: A Flexible and Efficient RLHF Framework},
-  author  = {Guangming Sheng and Chi Zhang and Zilingfeng Ye and Xibin Wu and Wang Zhang and Ru Zhang and Yanghua Peng and Haibin Lin and Chuan Wu},
-  year    = {2024},
-  journal = {arXiv preprint arXiv: 2409.19256}
+#### verl version
+
+Switch to the [verl branch](https://github.com/volcengine/verl). Modify the `actor_rollout_ref.model.path`, `trainer.default_local_dir` in the [config file](verl/trainer/config/ppo_trainer.yaml). Then start training:
+
+```bash
+python -m verl.trainer.main_ppo
+```
+
+The single controller of verl allows for higher gpu utilization compared to the openrlhf version.
+
+### Evaluation of Math Reasoning
+
+We use [Qwen Math's codebase](https://github.com/QwenLM/Qwen2.5-Math/tree/main/evaluation) for evaluation (i.e., pass@1 accuracy). For fairness considerations, we completely prohibited solving problems by calling code, following SimpleRL. Please follow the `/eval` instructions for evaluation.
+
+## :bulb: Discussions
+
+See our [notion blog](https://tungsten-ink-510.notion.site/Stop-Gamma-Decay-Min-Form-Credit-Assignment-Is-All-Process-Reward-Model-Needs-for-Reasoning-19fcb6ed0184804eb07fd310b38af155?pvs=4) for more discussions.
+
+### Reward Hacking
+
+Reward hacking often occurs when relying solely on process rewards from the PRM, typically marked by sudden, extreme changes in metrics like reward, KL divergence, and loss. Meanwhile, the model starts only generating irrelevant outputs like "thanks" or "happy birthday" without any other string related to the questions. Since PRM is trained and inferences causally, such outputs can yield positive process scores, even though they are meaningless for math reasoning. You can see examples of this in the [wandb log](https://wandb.ai/cjreinforce/openrlhf_train_ppo/workspace?nw=nwuserchrisjina) with run name starting with "PRM_". 
+
+In our experiments, reward hacking usually happened within the first 200 steps. However, before this occurs, the model performs well. For example, the Qwen2.5-7B-PURE-PRM model shown in the table above is saved at step 100, before hacking began.
+
+Another factor that can trigger reward hacking is the baseline choice in RLOO. One intuitive way is to use the average process reward per step from other answers in the group as the baseline. However, this setting favors answers with fewer steps (refer to this [issue](https://github.com/CJReinforce/PURE/issues/2) for details). Since we split steps using a specific character (i.e., "\n\n"), we find the model sometimes avoids this character, producing answers with fewer steps but excessively long tokens per step. The PRM struggles to assign accurate process rewards to such lengthy steps. To address this,  we change the baseline to the average reward per token from other answers, multiplied by the number of tokens in the current step. This improvement penalizes steps with more tokens more heavily and removes the bias toward fewer steps.
+
+### Aha Moment
+
+Unfortunately, we did not observe the aha moment, self-reflection, or long CoT for schemes using PRM. We suppose that even if an answer like "\<response A\> Wait, wait. \<response B\>" is generated in the rollout, the PRM will assign negative process rewards to response A and positive process rewards to response B. The PPO algorithm then probably decrease the sampling probability of response A, and increase the sampling probability of response B, resulting in the final model that just outputs response B and thus no aha moment.
+
+## 📝 TODO:
+
+- [x] re-implementation on [verl](https://github.com/volcengine/verl) (see `verl` [branch](https://github.com/CJReinforce/PURE/tree/verl))
+- [ ] paper with more discussions and evaluations
+- [ ] attempts to mitigate reward hacking for PRM (Online PURE)
+
+## 🎈 Citation
+
+If you find our code useful, we would appreciate it if you could cite our work:
+
+```bibtex
+@misc{cheng2025pure,
+  title={Stop Gamma Decay: Min-Form Credit Assignment Is All Process Reward Model Needs for Reasoning},
+  author={Jie Cheng and Lijun Li and Gang Xiong and Jing Shao and Yisheng Lv and Fei-Yue Wang},
+  year={2025},
+  howpublished={\url{https://tungsten-ink-510.notion.site/Stop-Gamma-Decay-Min-Form-Credit-Assignment-Is-All-Process-Reward-Model-Needs-for-Reasoning-19fcb6ed0184804eb07fd310b38af155?pvs=4}},
+  note={Notion Blog}
+  year={2025}
 }
 ```
 
-verl is inspired by the design of Nemo-Aligner, Deepspeed-chat and OpenRLHF. The project is adopted and supported by Anyscale, Bytedance, LMSys.org, Shanghai AI Lab, Tsinghua University, UC Berkeley, UCLA, UIUC, University of Hong Kong, and many more.
+## 🌻 Acknowledgement
 
-## Awesome work using verl
-- [TinyZero](https://github.com/Jiayi-Pan/TinyZero): a reproduction of **DeepSeek R1 Zero** recipe for reasoning tasks
-- [PRIME](https://github.com/PRIME-RL/PRIME): Process reinforcement through implicit rewards
-- [RAGEN](https://github.com/ZihanWang314/ragen): a general-purpose reasoning **agent** training framework
-- [Logic-RL](https://github.com/Unakar/Logic-RL): a reproduction of DeepSeek R1 Zero on 2K Tiny Logic Puzzle Dataset.
-- [deepscaler](https://github.com/agentica-project/deepscaler): iterative context scaling with GRPO
-- [critic-rl](https://github.com/HKUNLP/critic-rl): LLM critics for code generation
-- [Easy-R1](https://github.com/hiyouga/EasyR1): **Multi-modal** RL training framework
-- [self-rewarding-reasoning-LLM](https://arxiv.org/pdf/2502.19613): self-rewarding and correction with **generative reward models**
-- [Search-R1](https://github.com/PeterGriffinJin/Search-R1): RL with reasoning and **searching (tool-call)** interleaved LLMs
-- [Code-R1](https://github.com/ganler/code-r1): Reproducing R1 for **Code** with Reliable Rewards
-- [DQO](https://arxiv.org/abs/2410.09302): Enhancing multi-Step reasoning abilities of language models through direct Q-function optimization
-- [FIRE](https://arxiv.org/abs/2410.21236): Flaming-hot initiation with regular execution sampling for large language models
-
-## Contribution Guide
-Contributions from the community are welcome! Please checkout our [roadmap](https://github.com/volcengine/verl/issues/22) and [release plan](https://github.com/volcengine/verl/issues/354).
-
-### Code formatting
-We use yapf (Google style) to enforce strict code formatting when reviewing PRs. To reformat you code locally, make sure you installed **latest** `yapf`
-```bash
-pip3 install yapf --upgrade
-```
-Then, make sure you are at top level of verl repo and run
-```bash
-bash scripts/format.sh
-```
-We are HIRING! Send us an [email](mailto:haibin.lin@bytedance.com) if you are interested in internship/FTE opportunities in MLSys/LLM reasoning/multimodal alignment.
+We implement our RL algorithm based on [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF) and [verl](https://github.com/volcengine/verl). We thank the developers of OpenRLHF and the author of SimpleRL for discussion! In addition, we also refer to [TRL](https://github.com/huggingface/trl), [PRIME](https://github.com/PRIME-RL/PRIME)'s code and hyperparameter values to varying degrees. Thank them for their wonderful work!

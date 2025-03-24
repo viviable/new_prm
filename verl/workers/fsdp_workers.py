@@ -1203,10 +1203,12 @@ class ProcessRewardModelWorker(Worker):
         self._is_offload_param = self.config.model.fsdp_config.param_offload
         self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
 
-        self.disable_min_form_credit_assignment = self.config.get(
-            'disable_min_form_credit_assignment', False,
-        )
-        self.temperature = self.config.get('temperature', 0.1)
+        credit_assignment = self.config.get('credit_assignment', 0.1)
+        if credit_assignment in ['gamma-decay', 'strict min-form']:
+            self.disable_approx_min_form_credit_assignment = True
+        else:
+            self.disable_approx_min_form_credit_assignment = False
+            self.temperature = credit_assignment
 
         # TODO: online training of PRM
         assert not self.config.training, "Not support yet."
@@ -1525,7 +1527,7 @@ class ProcessRewardModelWorker(Worker):
         rm_score = rm_score.softmax(dim=-1)
         rm_score = (rm_score[..., 1] - rm_score[..., 0]) * reward_mask  # (batch_size, seq_len)
         
-        if not self.disable_min_form_credit_assignment:
+        if not self.disable_approx_min_form_credit_assignment:
             weight = torch.softmax(
                 -rm_score.masked_fill(
                     ~reward_mask, float('inf')

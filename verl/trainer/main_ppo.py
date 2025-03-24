@@ -134,12 +134,19 @@ def main_task(config, compute_score=None):
     elif reward_manager_name == 'prime':
         from verl.workers.reward_manager import PrimeRewardManager
         reward_manager_cls = PrimeRewardManager
+    elif reward_manager_name == 'blank':
+        from verl.workers.reward_manager import BlankRewardManager
+        from verl.workers.reward_manager import PrimeRewardManager
+        reward_manager_cls = BlankRewardManager
     else:
         raise NotImplementedError
     reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
+    if reward_manager_name == 'blank':
+        val_reward_fn = PrimeRewardManager(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
+    else:
+        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
     
