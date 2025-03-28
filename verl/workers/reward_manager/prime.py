@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import signal
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 
@@ -20,6 +21,21 @@ import torch
 
 from verl import DataProto
 from verl.utils.reward_score import _default_compute_score
+
+
+def evaluation_func_wrapper(evaluation_func, task, completion, reference, timeout):
+    class TimeoutException(Exception):
+        pass
+
+    def alarm_handler(*args, **kwargs):
+        raise TimeoutException("Function execution exceeded timeout.")
+
+    signal.signal(signal.SIGALRM, alarm_handler)
+    signal.alarm(int(timeout))
+    try:
+        return evaluation_func(task, completion, reference)
+    finally:
+        signal.alarm(0)
 
 
 async def single_compute_score(evaluation_func, completion, reference, task, executor, timeout=300.):
@@ -30,7 +46,7 @@ async def single_compute_score(evaluation_func, completion, reference, task, exe
             asyncio.wait_for(
                 loop.run_in_executor(
                     executor,
-                    partial(evaluation_func, task, completion, reference)  # Ensure synchronous
+                    partial(evaluation_func_wrapper, evaluation_func, task, completion, reference, timeout)  # Ensure synchronous
                 ),
                 timeout=timeout)
         ]
@@ -87,10 +103,6 @@ class PrimeRewardManager:
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
 
-        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        # if 'rm_scores' in data.batch.keys():
-        #     return data.batch['rm_scores']
-
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
         already_print_data_sources = {}
@@ -98,14 +110,14 @@ class PrimeRewardManager:
         # batched scoring
         prompt_ids = data.batch['prompts']
         prompt_length = prompt_ids.shape[-1]
+        prompt_str = self.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
 
         response_ids = data.batch['responses']
         valid_response_length = data.batch['attention_mask'][:, prompt_length:].sum(dim=-1)
         sequences_str = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
-        # ground_truth = [data_item.non_tensor_batch['reward_model']['ground_truth'] for data_item in data]
-        # data_sources = data.non_tensor_batch['data_source']
         ground_truth = [data_item.non_tensor_batch['answer'] for data_item in data]
-        data_sources = ['numina_aops_forum'] * len(sequences_str)  # tricky: force to use prime_math.compute_score
+        default_data_sources = ['numina_aops_forum'] * len(sequences_str)  # tricky: force to use prime_math.compute_score
+        data_sources = data.batch.get('data_sources', default_data_sources)
 
         assert len(sequences_str) == len(ground_truth) == len(data_sources)
         try:
@@ -121,7 +133,20 @@ class PrimeRewardManager:
         except Exception as e:
             print(f"Unexpected error in batched reward computing. Setting all as 0.: {e}")
             scores = [0. for _ in range(len(sequences_str))]
-
+        
+        scores = torch.tensor(scores, dtype=torch.float32, device=prompt_ids.device)
+        rm_scores = data.batch.get('rm_scores', None)
+        orm_match_vr = None
+        if rm_scores is not None:
+            # orm score > 0 and vr = 1
+            # or orm score <= 0 and vr = 0
+            # then orm_match_vr is True
+            outcome_reward = rm_scores.sum(-1)
+            predictions = outcome_reward.sign()
+            predictions[predictions == -1] = 0
+            orm_match_vr = predictions == scores
+        
+        output_str = f"{'Rollout Example':#^{50}}\n"
         for i in range(len(data)):
             data_source = data_sources[i]
             reward_tensor[i, valid_response_length[i].item() - 1] = scores[i]
@@ -131,6 +156,21 @@ class PrimeRewardManager:
 
             if already_print_data_sources[data_source] < self.num_examine:
                 already_print_data_sources[data_source] += 1
-                print(sequences_str)
+                
+                output_str += f"Question:\n{repr(prompt_str[i])}\n"  # Unescaped prompts to check chat_template
+                steps = sequences_str[i].split('\n\n')
+                output_str += f"Rollout:\n{steps}\n"
+                output_str += f"Num of steps: {len(steps)}\n"
+                output_str += f"Ground-truth: {ground_truth[i]}\n"
+                output_str += f"Verifiable reward: {scores[i].item()}\n"
+                if orm_match_vr is not None:
+                    output_str += f"Outcome reward: {outcome_reward[i].item()}\n"
+                    output_str += f"ORM match VR? {orm_match_vr[i].item()}\n"
+                print(output_str.rstrip())
+        
+        output = DataProto.from_dict({
+            "verifiable_rewards": scores,
+            "reward_fn_scores": reward_tensor,
+            })
 
-        return reward_tensor
+        return output

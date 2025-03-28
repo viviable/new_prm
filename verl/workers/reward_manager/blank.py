@@ -20,8 +20,14 @@ class BlankRewardManager:
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine=0, compute_score=None) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         pass
 
     def __call__(self, data: DataProto):
-        return torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        output = DataProto.from_dict({
+            "verifiable_rewards": reward_tensor.sum(-1),
+            "reward_fn_scores": reward_tensor,
+            })
+
+        return output

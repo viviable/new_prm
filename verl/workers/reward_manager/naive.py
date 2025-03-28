@@ -76,4 +76,9 @@ class NaiveRewardManager:
                 already_print_data_sources[data_source] += 1
                 print(sequences_str)
 
-        return reward_tensor
+        output = DataProto.from_dict({
+            "verifiable_rewards": reward_tensor.sum(-1),
+            "reward_fn_scores": reward_tensor,
+            })
+
+        return output

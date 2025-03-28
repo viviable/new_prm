@@ -17,7 +17,9 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import time
 import uuid
+from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -26,7 +28,6 @@ from pprint import pprint
 from typing import Dict, Type
 
 import numpy as np
-from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -43,6 +44,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import ReFTDataset, RLHFDataset, collate_fn
+from verl.utils.monitored_metric import get_repeatness_and_reflection_score
 from verl.utils.seqlen_balancing import (
     get_seqlen_balanced_partitions,
     log_seqlen_unbalance,
@@ -227,17 +229,40 @@ def _compute_response_info(batch):
     prompt_length = prompt_mask.sum(-1).float()
     response_length = response_mask.sum(-1).float()  # (batch_size,)
 
+    correct_responses = batch.batch['verifiable_rewards'] == 1  # (batch_size,)
+    correct_response_length = response_length[correct_responses]
+    incorrect_response_length = response_length[~correct_responses]
+
     return dict(
         response_mask=response_mask,
         prompt_length=prompt_length,
         response_length=response_length,
+        correct_response_length=correct_response_length,
+        incorrect_response_length=incorrect_response_length,
     )
 
 
+def _compute_pass_at_n(batch):
+    index = batch.non_tensor_batch['uid']
+    verifiable_reward = batch.batch['verifiable_rewards']
+
+    bsz = len(index)
+    id2vr = defaultdict(list)
+    pass_at_n = {}
+
+    for i in range(bsz):
+        id2vr[index[i]].append(verifiable_reward[i].item())
+    
+    for k, v in id2vr.items():
+        pass_at_n[k] = np.any(v).astype(float)
+    return torch.tensor(list(pass_at_n.values()), dtype=torch.float32)
+
+
 def compute_data_metrics(batch, use_critic=True):
-    # TODO: add response length
     sequence_score = batch.batch['token_level_scores'].sum(-1)
     sequence_reward = batch.batch['token_level_rewards'].sum(-1)
+    verifiable_rewards = batch.batch['verifiable_rewards']
+    outcome_rewards = batch.batch['rm_scores'].sum(-1)
 
     advantages = batch.batch['advantages']
     returns = batch.batch['returns']
@@ -252,9 +277,16 @@ def compute_data_metrics(batch, use_critic=True):
     response_info = _compute_response_info(batch)
     prompt_length = response_info['prompt_length']
     response_length = response_info['response_length']
+    correct_response_length = response_info['correct_response_length']
+    incorrect_response_length = response_info['incorrect_response_length']
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
+
+    pass_at_n = _compute_pass_at_n(batch)
+    num_steps = batch.batch['num_steps']
+    repeat_score = batch.batch['repeat_score']
+    reflection_pattern_score = batch.batch['reflection_pattern_score']
 
     if use_critic:
         values = batch.batch['values']
@@ -263,6 +295,41 @@ def compute_data_metrics(batch, use_critic=True):
         return_var = torch.var(valid_returns)
 
     metrics = {
+        # verifiable reward
+        'critic/verifiable_reward/mean':
+            torch.mean(verifiable_rewards).detach().item(),
+        'critic/verifiable_reward/max':
+            torch.max(verifiable_rewards).detach().item(),
+        'critic/verifiable_reward/min':
+            torch.min(verifiable_rewards).detach().item(),
+        # pass@n
+        'critic/pass_at_n/mean':
+            torch.mean(pass_at_n).detach().item(),
+        'critic/pass_at_n/max':
+            torch.max(pass_at_n).detach().item(),
+        'critic/pass_at_n/min':
+            torch.min(pass_at_n).detach().item(),
+        # orm scores
+        'critic/outcome_reward/mean':
+            torch.mean(outcome_rewards).detach().item(),
+        'critic/outcome_reward/max':
+            torch.max(outcome_rewards).detach().item(),
+        'critic/outcome_reward/min':
+            torch.min(outcome_rewards).detach().item(),
+        # repeatness
+        'critic/repeat_score/mean':
+            torch.mean(repeat_score).detach().item(),
+        'critic/repeat_score/max':
+            torch.max(repeat_score).detach().item(),
+        'critic/repeat_score/min':
+            torch.min(repeat_score).detach().item(),
+        # reflection_pattern_score
+        'critic/reflection_pattern_score/mean':
+            torch.mean(reflection_pattern_score).detach().item(),
+        'critic/reflection_pattern_score/max':
+            torch.max(reflection_pattern_score).detach().item(),
+        'critic/reflection_pattern_score/min':
+            torch.min(reflection_pattern_score).detach().item(),
         # score
         'critic/score/mean':
             torch.mean(sequence_score).detach().item(),
@@ -309,6 +376,31 @@ def compute_data_metrics(batch, use_critic=True):
             torch.min(response_length).detach().item(),
         'response_length/clip_ratio':
             torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+        'response_length/correct_mean':
+            torch.mean(correct_response_length).detach().item(),
+        'response_length/correct_max':
+            torch.max(correct_response_length).detach().item(),
+        'response_length/correct_min':
+            torch.min(correct_response_length).detach().item(),
+        'response_length/correct_clip_ratio':
+            torch.mean(torch.eq(correct_response_length, max_response_length).float()).detach().item(),
+        'response_length/incorrect_mean':
+            torch.mean(incorrect_response_length).detach().item(),
+        'response_length/incorrect_max':
+            torch.max(incorrect_response_length).detach().item(),
+        'response_length/incorrect_min':
+            torch.min(incorrect_response_length).detach().item(),
+        'response_length/incorrect_clip_ratio':
+            torch.mean(torch.eq(incorrect_response_length, max_response_length).float()).detach().item(),
+        
+        # num of steps
+        'num_of_steps/mean':
+            torch.mean(num_steps).detach().item(),
+        'num_of_steps/max':
+            torch.max(num_steps).detach().item(),
+        'num_of_steps/min':
+            torch.min(num_steps).detach().item(),
+
         # prompt length
         'prompt_length/mean':
             torch.mean(prompt_length).detach().item(),
@@ -344,6 +436,19 @@ def compute_timing_metrics(batch, timing_raw):
             )) & set(timing_raw.keys())
         },
     }
+
+
+class Timer:
+    def __init__(self, name: str, *args, **kwargs):
+        self.name = name
+
+    def __enter__(self):
+        self.start_time = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.last = time.time() - self.start_time
+        print(f"{self.name.capitalize()} costs {self.last:.2f}s")
 
 
 @contextmanager
@@ -670,10 +775,10 @@ class RayPPOTrainer(object):
             test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
-            reward_tensor = self.val_reward_fn(test_batch)
+            reward_tensor = self.val_reward_fn(test_batch).batch['verifiable_rewards']
 
             # Store scores
-            scores = reward_tensor.sum(-1).cpu().tolist()
+            scores = reward_tensor.cpu().tolist()
             sample_scores.extend(scores)
 
             reward_tensor_lst.append(reward_tensor)
@@ -681,7 +786,7 @@ class RayPPOTrainer(object):
 
         self._maybe_log_val_generations_to_wandb(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        reward_tensor = torch.cat(reward_tensor_lst, dim=0).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
 
         # evaluate test_score based on data source
@@ -846,7 +951,7 @@ class RayPPOTrainer(object):
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
         if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path)
+            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
@@ -912,19 +1017,18 @@ class RayPPOTrainer(object):
 
                 with _timer('step', timing_raw):
                     # generate a batch
-                    with _timer('gen', timing_raw):
+                    with _timer('rollout', timing_raw):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         assert self.config.reward_model.enable, "Not support remax with reward model yet."
-                        with _timer('gen_max', timing_raw):
+                        with _timer('greedy_rollout', timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info['do_sample'] = False
                             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
                             batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                            reward_baseline_tensor = self.reward_fn(batch).batch['verifiable_rewards']
 
                             batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
@@ -947,19 +1051,19 @@ class RayPPOTrainer(object):
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
                     # recompute old_log_probs
-                    with _timer('old_log_prob', timing_raw):
+                    with _timer('compute_old_log_prob', timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         batch = batch.union(old_log_prob)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
-                        with _timer('ref', timing_raw):
+                        with _timer('compute_ref_log_prob', timing_raw):
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
-                        with _timer('values', timing_raw):
+                        with _timer('compute_values', timing_raw):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
@@ -967,23 +1071,31 @@ class RayPPOTrainer(object):
                     # We first compute the scores using reward model. Then, we call reward_fn to combine
                     # the results from reward model and rule-based results.
                     if self.use_rm:
-                        with _timer('rm', timing_raw):
-                            # we first compute reward model score
+                        with _timer('compute_rm_score', timing_raw):
+                            # return rm_scores
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
                     # we combine with rule-based rm
-                    with _timer('reward_fn', timing_raw):
+                    with _timer('call_reward_fn', timing_raw):
+                        # return 1. verifiable_rewards (outcome score) and
+                        # 2. reward_fn_scores (token-level score) 
                         reward_tensor = self.reward_fn(batch)
+                        batch = batch.union(reward_tensor)
 
-                    with _timer('adv', timing_raw):
+                    with _timer('compute_advantage', timing_raw):
+                        # 1. compute token-level scores from rm_scores and reward_fn_scores
+                        verifiable_rewards = batch.batch['reward_fn_scores']
+
                         if 'rm_scores' in batch.batch.keys():
-                            verifiable_reward_coef = self.config.reward_model.get('verifiable_reward_coef', 1.0)
-                            batch.batch['token_level_scores'] = reward_tensor * verifiable_reward_coef + batch.batch['rm_scores']
+                            vr_coef = self.config.reward_model.get('verifiable_reward_coef', 1.0)
+                            rm_scores = batch.batch['rm_scores']
+                            token_level_scores = verifiable_rewards * vr_coef + rm_scores
                         else:
-                            batch.batch['token_level_scores'] = reward_tensor
+                            token_level_scores = verifiable_rewards
+                        batch.batch['token_level_scores'] = token_level_scores
 
-                        # compute rewards. apply_kl_penalty if available
+                        # 2. compute kl penalty for token-level rewards
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
                             batch, kl_metrics = apply_kl_penalty(
                                 batch,
@@ -994,7 +1106,7 @@ class RayPPOTrainer(object):
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
-                        # compute advantages, executed on the driver process
+                        # 3. compute advantages
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1019,6 +1131,14 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+                    
+                    # repeatness & reflection pattern score
+                    with _timer('compute_additional_metrics', timing_raw):
+                        additional_metrics = get_repeatness_and_reflection_score(
+                            data=batch, 
+                            tokenizer=self.tokenizer,
+                        )
+                        batch = batch.union(additional_metrics)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
